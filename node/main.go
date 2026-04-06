@@ -104,7 +104,10 @@ func (rn *RaftNode) RegisterToMaster() error {
 		"address": rn.selfAddr,
 	}
 
-	jsonData, _ := json.Marshal(req)
+	jsonData, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
 	resp, err := http.Post(
 		fmt.Sprintf("http://%s/api/register", rn.masterAddr),
 		"application/json",
@@ -129,7 +132,10 @@ func (rn *RaftNode) SendHeartbeat() error {
 		"node_id": rn.nodeID,
 	}
 
-	jsonData, _ := json.Marshal(req)
+	jsonData, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
 	resp, err := http.Post(
 		fmt.Sprintf("http://%s/api/heartbeat", rn.masterAddr),
 		"application/json",
@@ -191,6 +197,13 @@ func (rn *RaftNode) GetPeers() ([]string, error) {
 
 // StartElection 开始选举
 func (rn *RaftNode) StartElection() {
+	// 先获取节点列表（IO 操作，不能在持锁状态下执行）
+	peers, err := rn.GetPeers()
+	if err != nil {
+		fmt.Printf("[Node %s] 获取节点列表失败：%v\n", rn.nodeID, err)
+		return
+	}
+
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
@@ -198,15 +211,9 @@ func (rn *RaftNode) StartElection() {
 	rn.currentTerm++
 	rn.votedFor = rn.nodeID
 	rn.votesReceived = 1
+	rn.peers = peers // 更新已知节点列表用于多数派计算
 
-	fmt.Printf("[Node %s] 开始选举，Term %d\n", rn.nodeID, rn.currentTerm)
-
-	// 获取节点列表
-	peers, err := rn.GetPeers()
-	if err != nil {
-		fmt.Printf("[Node %s] 获取节点列表失败：%v\n", rn.nodeID, err)
-		return
-	}
+	fmt.Printf("[Node %s] 开始选举，Term %d，共 %d 个节点\n", rn.nodeID, rn.currentTerm, len(peers)+1)
 
 	// 向其他节点请求投票
 	for _, peerAddr := range peers {
@@ -215,6 +222,9 @@ func (rn *RaftNode) StartElection() {
 
 	rn.resetElectionTimer()
 }
+
+// voteClient 用于投票请求的 HTTP 客户端（带超时）
+var voteClient = &http.Client{Timeout: 500 * time.Millisecond}
 
 // sendVoteRequest 发送投票请求
 func (rn *RaftNode) sendVoteRequest(peerAddr string) {
@@ -231,15 +241,19 @@ func (rn *RaftNode) sendVoteRequest(peerAddr string) {
 	}
 
 	req := map[string]interface{}{
-		"term":          rn.currentTerm,
-		"candidate_id":  rn.nodeID,
+		"term":           rn.currentTerm,
+		"candidate_id":   rn.nodeID,
 		"last_log_index": lastLogIndex,
 		"last_log_term":  lastLogTerm,
 	}
+	clusterSize := len(rn.peers) + 1 // 含自身
 	rn.mu.Unlock()
 
-	jsonData, _ := json.Marshal(req)
-	resp, err := http.Post(
+	jsonData, err := json.Marshal(req)
+	if err != nil {
+		return
+	}
+	resp, err := voteClient.Post(
 		fmt.Sprintf("http://%s/api/vote", peerAddr),
 		"application/json",
 		bytes.NewBuffer(jsonData),
@@ -253,7 +267,9 @@ func (rn *RaftNode) sendVoteRequest(peerAddr string) {
 		Term        int  `json:"term"`
 		VoteGranted bool `json:"vote_granted"`
 	}
-	json.NewDecoder(resp.Body).Decode(&voteResp)
+	if err := json.NewDecoder(resp.Body).Decode(&voteResp); err != nil {
+		return
+	}
 
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -265,9 +281,10 @@ func (rn *RaftNode) sendVoteRequest(peerAddr string) {
 
 	if voteResp.VoteGranted && rn.state == Candidate && voteResp.Term == rn.currentTerm {
 		rn.votesReceived++
-		fmt.Printf("[Node %s] 收到投票，共 %d 票\n", rn.nodeID, rn.votesReceived)
+		fmt.Printf("[Node %s] 收到投票，共 %d/%d 票\n", rn.nodeID, rn.votesReceived, clusterSize)
 
-		if rn.votesReceived > 2 { // 简单起见，假设 5 节点集群
+		// 动态计算多数派：超过集群半数即可
+		if rn.votesReceived > clusterSize/2 {
 			rn.becomeLeader()
 		}
 	}
@@ -294,19 +311,28 @@ func (rn *RaftNode) becomeFollower(term int) {
 // reportStateToMaster 向 Master 报告状态
 func (rn *RaftNode) reportStateToMaster() {
 	req := map[string]interface{}{
-		"key":   fmt.Sprintf("node_%s_state", rn.nodeID),
+		"key": fmt.Sprintf("node_%s_state", rn.nodeID),
 		"value": map[string]interface{}{
 			"state": rn.state.String(),
 			"term":  rn.currentTerm,
 		},
 	}
 
-	jsonData, _ := json.Marshal(req)
-	http.Post(
+	jsonData, err := json.Marshal(req)
+	if err != nil {
+		fmt.Printf("[Node %s] 序列化状态失败：%v\n", rn.nodeID, err)
+		return
+	}
+	resp, err := http.Post(
 		fmt.Sprintf("http://%s/api/raft-state", rn.masterAddr),
 		"application/json",
 		bytes.NewBuffer(jsonData),
 	)
+	if err != nil {
+		fmt.Printf("[Node %s] 上报状态失败：%v\n", rn.nodeID, err)
+		return
+	}
+	resp.Body.Close()
 }
 
 // StartElectionLoop 启动选举循环

@@ -54,18 +54,52 @@ func (s *NodeHTTPServer) voteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	node := s.node
+	node.mu.Lock()
+	defer node.mu.Unlock()
 
-	// 简化处理：总是投票给第一个请求者（实际应该检查日志新旧）
-	resp := VoteResponse{
-		Term:        req.Term,
-		VoteGranted: true,
+	resp := VoteResponse{Term: node.currentTerm, VoteGranted: false}
+
+	// 候选人的 Term 小于当前 Term，拒绝投票
+	if req.Term < node.currentTerm {
+		json.NewEncoder(w).Encode(resp)
+		return
 	}
 
-	fmt.Printf("[Node %s] 收到投票请求，Term %d，投票：%v\n",
-		s.node.nodeID, req.Term, resp.VoteGranted)
+	// 发现更大的 Term，退回 Follower 状态
+	if req.Term > node.currentTerm {
+		node.currentTerm = req.Term
+		node.state = Follower
+		node.votedFor = ""
+	}
+	resp.Term = node.currentTerm
 
+	// 本 Term 已投票给其他候选人，拒绝
+	if node.votedFor != "" && node.votedFor != req.CandidateID {
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	// 检查候选人的日志是否至少和自己一样新（Raft 日志完整性检查）
+	lastLogIndex := len(node.log) - 1
+	lastLogTerm := 0
+	if lastLogIndex >= 0 {
+		lastLogTerm = node.log[lastLogIndex].Term
+	}
+	logUpToDate := req.LastLogTerm > lastLogTerm ||
+		(req.LastLogTerm == lastLogTerm && req.LastLogIndex >= lastLogIndex)
+
+	if !logUpToDate {
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	// 授予投票
+	node.votedFor = req.CandidateID
+	node.resetElectionTimer()
+	resp.VoteGranted = true
+
+	fmt.Printf("[Node %s] 投票给 %s，Term %d\n", node.nodeID, req.CandidateID, req.Term)
 	json.NewEncoder(w).Encode(resp)
 }
 

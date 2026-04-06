@@ -15,15 +15,9 @@ func main() {
 	fmt.Println("创建一个包含 5 个节点的 Raft 集群\n")
 
 	// 创建 5 个 Raft 节点
+	// 先分配切片，再统一创建，避免先创建 nil-peers 节点导致 goroutine 泄漏
 	numNodes := 5
 	nodes := make([]*raft.Raft, numNodes)
-
-	// 先创建所有节点（互相引用）
-	for i := 0; i < numNodes; i++ {
-		nodes[i] = raft.NewRaft(nil, i)
-	}
-
-	// 设置 peers 引用
 	for i := 0; i < numNodes; i++ {
 		nodes[i] = raft.NewRaft(nodes, i)
 	}
@@ -158,9 +152,7 @@ cleanup:
 	time.Sleep(100 * time.Millisecond)
 }
 
-// getCommitIndex 获取节点的 commitIndex（通过反射或公开方法）
-// 这里简化处理，返回日志长度
+// getCommitIndex 获取节点已提交的最高日志索引
 func getCommitIndex(node *raft.Raft) int {
-	log := node.GetLog()
-	return len(log)
+	return node.GetCommitIndex()
 }
