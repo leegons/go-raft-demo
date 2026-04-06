@@ -312,7 +312,7 @@ func main() {
 				addr := fmt.Sprintf("localhost:%d", port)
 				fmt.Printf("🚀 启动节点，地址：%s\n", addr)
 				// 这里只是示例，实际需要 fork 进程
-				fmt.Println("(提示：在新终端运行：go run node/main.go nodeX localhost:8080 %s)\n", addr)
+				fmt.Printf("(提示：在新终端运行：go run node/main.go nodeX localhost:8080 %s)\n", addr)
 			} else {
 				fmt.Printf("未知命令：%s\n", cmd)
 				fmt.Println("输入 'status', 'nodes', 'leader', 'submit <消息>', 'log', 或 'quit'")

@@ -230,17 +230,18 @@ func (rf *Raft) RequestVote(req VoteRequest) VoteResponse {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	resp := VoteResponse{Term: rf.currentTerm, VoteGranted: false}
-
-	// 如果请求的 Term 小于当前 Term，拒绝
+	// 如果请求的 Term 小于当前 Term，拒绝（用当前 Term 回复）
 	if req.Term < rf.currentTerm {
-		return resp
+		return VoteResponse{Term: rf.currentTerm, VoteGranted: false}
 	}
 
-	// 如果请求的 Term 大于当前 Term，转为 Follower
+	// 如果请求的 Term 大于当前 Term，转为 Follower（更新 currentTerm）
 	if req.Term > rf.currentTerm {
 		rf.becomeFollower(req.Term)
 	}
+
+	// 此时 currentTerm 已与 req.Term 对齐
+	resp := VoteResponse{Term: rf.currentTerm, VoteGranted: false}
 
 	// 检查是否已投票给其他候选人
 	if rf.votedFor != -1 && rf.votedFor != req.CandidateId {
@@ -263,7 +264,6 @@ func (rf *Raft) RequestVote(req VoteRequest) VoteResponse {
 
 	// 投票给候选人
 	rf.votedFor = req.CandidateId
-	rf.currentTerm = req.Term
 	resp.VoteGranted = true
 
 	fmt.Printf("[Node %d] 投票给 Node %d，Term %d\n", rf.me, req.CandidateId, req.Term)
@@ -279,11 +279,11 @@ func (rf *Raft) becomeLeader() {
 	// 初始化 nextIndex 和 matchIndex
 	for i := range rf.peers {
 		rf.nextIndex[i] = len(rf.log)
-		rf.matchIndex[i] = 0
+		rf.matchIndex[i] = -1
 	}
 
-	// 发送心跳
-	rf.sendHeartbeats()
+	// 启动心跳循环（独立 goroutine，避免 time.AfterFunc 定时器累积）
+	go rf.heartbeatLoop()
 }
 
 // becomeFollower 成为 Follower
@@ -295,20 +295,46 @@ func (rf *Raft) becomeFollower(term int) {
 	fmt.Printf("[Node %d] 成为 Follower，Term %d\n", rf.me, term)
 }
 
-// sendHeartbeats 发送心跳（空的 AppendEntries）
-func (rf *Raft) sendHeartbeats() {
-	if !rf.running || rf.state != Leader {
+// heartbeatLoop 以固定间隔向所有 Follower 发送心跳，直到不再是 Leader
+func (rf *Raft) heartbeatLoop() {
+	ticker := time.NewTicker(rf.heartbeatTimeout)
+	defer ticker.Stop()
+
+	// 立即发送一次心跳
+	rf.sendHeartbeatsOnce()
+
+	for {
+		select {
+		case <-ticker.C:
+			rf.mu.Lock()
+			isLeader := rf.state == Leader && rf.running
+			rf.mu.Unlock()
+			if !isLeader {
+				return
+			}
+			rf.sendHeartbeatsOnce()
+		case <-rf.stopCh:
+			return
+		}
+	}
+}
+
+// sendHeartbeatsOnce 向所有 Follower 发送一次 AppendEntries（心跳或日志复制）
+func (rf *Raft) sendHeartbeatsOnce() {
+	rf.mu.Lock()
+	if rf.state != Leader || !rf.running {
+		rf.mu.Unlock()
 		return
 	}
+	peers := rf.peers
+	me := rf.me
+	rf.mu.Unlock()
 
-	for peerId := range rf.peers {
-		if peerId != rf.me {
+	for peerId := range peers {
+		if peerId != me {
 			go rf.sendAppendEntries(peerId)
 		}
 	}
-
-	// 定期发送心跳
-	time.AfterFunc(rf.heartbeatTimeout, rf.sendHeartbeats)
 }
 
 // sendAppendEntries 发送日志追加请求
@@ -359,10 +385,14 @@ func (rf *Raft) sendAppendEntries(peerId int) {
 
 	// 更新 nextIndex 和 matchIndex
 	if resp.Success {
-		if prevLogIndex+len(entries) > rf.nextIndex[peerId] {
-			rf.nextIndex[peerId] = prevLogIndex + len(entries)
+		newMatchIndex := prevLogIndex + len(entries)
+		if newMatchIndex > rf.matchIndex[peerId] {
+			rf.matchIndex[peerId] = newMatchIndex
 		}
-		rf.matchIndex[peerId] = prevLogIndex + len(entries)
+		// nextIndex 指向下一条待发送的日志（matchIndex 之后）
+		if newMatchIndex+1 > rf.nextIndex[peerId] {
+			rf.nextIndex[peerId] = newMatchIndex + 1
+		}
 
 		// 检查是否可以提交日志
 		rf.updateCommitIndex()
@@ -377,17 +407,20 @@ func (rf *Raft) sendAppendEntries(peerId int) {
 // updateCommitIndex 更新提交索引
 func (rf *Raft) updateCommitIndex() {
 	for n := rf.commitIndex + 1; n < len(rf.log); n++ {
-		if rf.log[n].Term == rf.currentTerm {
-			count := 1
-			for i := range rf.peers {
-				if i != rf.me && rf.matchIndex[i] >= n {
-					count++
-				}
+		// 只提交当前 Term 的日志（Raft 安全性要求）
+		if rf.log[n].Term != rf.currentTerm {
+			continue
+		}
+		// Leader 自身算 1 票，统计已复制到多数节点的日志
+		count := 1
+		for i := range rf.peers {
+			if i != rf.me && rf.matchIndex[i] >= n {
+				count++
 			}
-			if count > len(rf.peers)/2 {
-				rf.commitIndex = n
-				fmt.Printf("[Node %d] 提交日志索引 %d\n", rf.me, n)
-			}
+		}
+		if count > len(rf.peers)/2 {
+			rf.commitIndex = n
+			fmt.Printf("[Node %d] 提交日志索引 %d\n", rf.me, n)
 		}
 	}
 }
@@ -404,12 +437,10 @@ func (rf *Raft) AppendEntries(req AppendEntriesRequest) AppendEntriesResponse {
 		return resp
 	}
 
-	// 如果请求的 Term 大于等于当前 Term，转为 Follower
+	// 如果请求的 Term 大于等于当前 Term，转为 Follower（becomeFollower 内已重置选举定时器）
 	if req.Term >= rf.currentTerm {
 		rf.becomeFollower(req.Term)
 	}
-
-	rf.resetElectionTimer()
 
 	// 检查 PrevLogIndex 和 PrevLogTerm
 	if req.PrevLogIndex >= len(rf.log) {
@@ -487,6 +518,13 @@ func (rf *Raft) GetState() (State, int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.state, rf.currentTerm
+}
+
+// GetCommitIndex 获取已提交的最高日志索引
+func (rf *Raft) GetCommitIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.commitIndex
 }
 
 // GetLog 获取日志
